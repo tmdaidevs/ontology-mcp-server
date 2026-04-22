@@ -1,0 +1,12 @@
+[project]
+name = "fabric-ontology-mcp"
+version = "0.1.0"
+description = "MCP server for full CRUD control of Ontology items in Microsoft Fabric"
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.28.1",
+    "mcp[cli]>=1.27.0",
+]
+
+[project.scripts]
+fabric-ontology-mcp = "src.server:main"
