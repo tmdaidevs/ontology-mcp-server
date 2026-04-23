@@ -1,7 +1,10 @@
 """Fabric Ontology MCP Server — full CRUD for Ontology items in Microsoft Fabric."""
 
 import json
+import logging
 import random
+import re
+import sys
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -14,7 +17,17 @@ from .definition_utils import decode_definition, encode_definition
 from .fabric_client import FabricClient
 from .kusto_client import KustoClient
 
+# ── Logging (MCP requires stderr) ──
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(name)s %(levelname)s %(message)s",
+    stream=sys.stderr,
+)
+logger = logging.getLogger("fabric-ontology-mcp")
+
 _VALID_KUSTO_HOSTS = (".kusto.fabric.microsoft.com", ".kusto.windows.net")
+_VALID_VALUE_TYPES = {"String", "Boolean", "DateTime", "Object", "BigInt", "Double"}
+_NAME_PATTERN = re.compile(r"^[a-zA-Z][a-zA-Z0-9_-]{0,127}$")
 
 
 @dataclass
@@ -63,6 +76,33 @@ def _validate_kusto_host(uri: str) -> None:
         raise ValueError(
             f"Invalid Kusto cluster URI. Host must end with one of: {', '.join(_VALID_KUSTO_HOSTS)}"
         )
+
+
+def _validate_name(value: str, field: str = "name") -> None:
+    """Validate entity/relationship/property names against Fabric's naming rules."""
+    if not _NAME_PATTERN.match(value):
+        raise ValueError(
+            f"Invalid {field}: '{value}'. Must start with a letter, contain only "
+            f"letters/numbers/underscores/hyphens, and be 1–128 characters."
+        )
+
+
+def _validate_value_type(value_type: str) -> None:
+    """Validate property value type against allowed values."""
+    if value_type not in _VALID_VALUE_TYPES:
+        raise ValueError(
+            f"Invalid valueType: '{value_type}'. Must be one of: {', '.join(sorted(_VALID_VALUE_TYPES))}"
+        )
+
+
+def _parse_json(text: str, field: str) -> Any:
+    """Parse a JSON string with a user-friendly error message."""
+    if isinstance(text, (dict, list)):
+        return text
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Invalid JSON in {field}: {e.msg} (position {e.pos})")
 
 
 def _generate_id() -> str:
@@ -309,7 +349,7 @@ async def update_ontology_definition_raw(
         ontology_id: The ontology UUID.
         definition_json: JSON string of the full definition structure.
     """
-    decoded = json.loads(definition_json)
+    decoded = _parse_json(definition_json, "definition_json")
     parts = encode_definition(decoded)
     await _client(ctx).update_ontology_definition(
         workspace_id, ontology_id, {"parts": parts}
@@ -374,6 +414,27 @@ async def list_entity_types(workspace_id: str, ontology_id: str, ctx: Context) -
 
 
 @mcp.tool()
+async def get_entity_type(
+    workspace_id: str,
+    ontology_id: str,
+    entity_type_id: str,
+    ctx: Context,
+) -> dict:
+    """Get a single entity type by ID, including its data bindings, documents, overviews, and resource links.
+
+    Args:
+        workspace_id: The workspace UUID.
+        ontology_id: The ontology UUID.
+        entity_type_id: The entity type ID.
+    """
+    decoded = await _get_decoded_definition(_client(ctx), workspace_id, ontology_id)
+    et = decoded.get("entityTypes", {}).get(entity_type_id)
+    if not et:
+        raise ValueError(f"Entity type {entity_type_id} not found.")
+    return et
+
+
+@mcp.tool()
 async def add_entity_type(
     workspace_id: str,
     ontology_id: str,
@@ -391,18 +452,21 @@ async def add_entity_type(
         properties: JSON array of properties, each with "name" and "valueType" (String, Boolean, DateTime, Object, BigInt, Double). Example: [{"name": "DisplayName", "valueType": "String"}]
         timeseries_properties: JSON array of timeseries properties (same format as properties).
     """
+    _validate_name(name, "entity type name")
     client = _client(ctx)
     decoded = await _get_decoded_definition(client, workspace_id, ontology_id)
 
     et_id = _generate_id()
 
     # Parse properties
-    props_input = json.loads(properties) if isinstance(properties, str) else properties
-    ts_props_input = json.loads(timeseries_properties) if isinstance(timeseries_properties, str) else timeseries_properties
+    props_input = _parse_json(properties, "properties")
+    ts_props_input = _parse_json(timeseries_properties, "timeseries_properties")
 
     props = []
     first_prop_id = None
     for p in props_input:
+        _validate_name(p["name"], "property name")
+        _validate_value_type(p.get("valueType", "String"))
         prop_id = _generate_id()
         if first_prop_id is None:
             first_prop_id = prop_id
@@ -416,6 +480,8 @@ async def add_entity_type(
 
     ts_props = []
     for p in ts_props_input:
+        _validate_name(p["name"], "timeseries property name")
+        _validate_value_type(p.get("valueType", "String"))
         ts_props.append({
             "id": _generate_id(),
             "name": p["name"],
@@ -486,6 +552,47 @@ async def remove_entity_type(
     return f"Entity type {entity_type_id} removed successfully."
 
 
+@mcp.tool()
+async def update_entity_type(
+    workspace_id: str,
+    ontology_id: str,
+    entity_type_id: str,
+    ctx: Context,
+    name: Optional[str] = None,
+    display_name_property_id: Optional[str] = None,
+    entity_id_parts: Optional[str] = None,
+) -> dict:
+    """Update an entity type's name, display name property, or entity ID parts.
+
+    Args:
+        workspace_id: The workspace UUID.
+        ontology_id: The ontology UUID.
+        entity_type_id: The entity type ID.
+        name: New name for the entity type (optional).
+        display_name_property_id: Property ID to use as display name (optional).
+        entity_id_parts: JSON array of property IDs that uniquely identify entities (optional).
+    """
+    client = _client(ctx)
+    decoded = await _get_decoded_definition(client, workspace_id, ontology_id)
+
+    et = decoded.get("entityTypes", {}).get(entity_type_id)
+    if not et:
+        raise ValueError(f"Entity type {entity_type_id} not found.")
+
+    defn = et["definition"]
+    if name is not None:
+        _validate_name(name, "entity type name")
+        defn["name"] = name
+    if display_name_property_id is not None:
+        defn["displayNamePropertyId"] = display_name_property_id
+    if entity_id_parts is not None:
+        defn["entityIdParts"] = _parse_json(entity_id_parts, "entity_id_parts")
+
+    await _push_definition(client, workspace_id, ontology_id, decoded)
+    logger.info("Updated entity type %s in ontology %s", entity_type_id, ontology_id)
+    return defn
+
+
 # ════════════════════════════════════════════════════════════════
 #  PROPERTY TOOLS
 # ════════════════════════════════════════════════════════════════
@@ -511,6 +618,8 @@ async def add_property(
         value_type: One of: String, Boolean, DateTime, Object, BigInt, Double.
         is_timeseries: If True, adds as a timeseries property.
     """
+    _validate_name(name, "property name")
+    _validate_value_type(value_type)
     client = _client(ctx)
     decoded = await _get_decoded_definition(client, workspace_id, ontology_id)
 
@@ -567,6 +676,58 @@ async def remove_property(
     return f"Property {property_id} removed successfully."
 
 
+@mcp.tool()
+async def update_property(
+    workspace_id: str,
+    ontology_id: str,
+    entity_type_id: str,
+    property_id: str,
+    ctx: Context,
+    name: Optional[str] = None,
+    value_type: Optional[str] = None,
+) -> dict:
+    """Update a property's name or value type.
+
+    Args:
+        workspace_id: The workspace UUID.
+        ontology_id: The ontology UUID.
+        entity_type_id: The entity type ID.
+        property_id: The property ID to update.
+        name: New property name (optional).
+        value_type: New value type (optional). One of: String, Boolean, DateTime, Object, BigInt, Double.
+    """
+    if name is not None:
+        _validate_name(name, "property name")
+    if value_type is not None:
+        _validate_value_type(value_type)
+
+    client = _client(ctx)
+    decoded = await _get_decoded_definition(client, workspace_id, ontology_id)
+
+    et = decoded.get("entityTypes", {}).get(entity_type_id)
+    if not et:
+        raise ValueError(f"Entity type {entity_type_id} not found.")
+
+    defn = et["definition"]
+    target_prop = None
+    for p in defn.get("properties", []) + defn.get("timeseriesProperties", []):
+        if str(p["id"]) == str(property_id):
+            target_prop = p
+            break
+
+    if not target_prop:
+        raise ValueError(f"Property {property_id} not found in entity type {entity_type_id}.")
+
+    if name is not None:
+        target_prop["name"] = name
+    if value_type is not None:
+        target_prop["valueType"] = value_type
+
+    await _push_definition(client, workspace_id, ontology_id, decoded)
+    logger.info("Updated property %s in entity type %s", property_id, entity_type_id)
+    return target_prop
+
+
 # ════════════════════════════════════════════════════════════════
 #  RELATIONSHIP TYPE TOOLS
 # ════════════════════════════════════════════════════════════════
@@ -590,6 +751,27 @@ async def list_relationship_types(workspace_id: str, ontology_id: str, ctx: Cont
 
 
 @mcp.tool()
+async def get_relationship_type(
+    workspace_id: str,
+    ontology_id: str,
+    relationship_type_id: str,
+    ctx: Context,
+) -> dict:
+    """Get a single relationship type by ID, including its contextualizations.
+
+    Args:
+        workspace_id: The workspace UUID.
+        ontology_id: The ontology UUID.
+        relationship_type_id: The relationship type ID.
+    """
+    decoded = await _get_decoded_definition(_client(ctx), workspace_id, ontology_id)
+    rt = decoded.get("relationshipTypes", {}).get(relationship_type_id)
+    if not rt:
+        raise ValueError(f"Relationship type {relationship_type_id} not found.")
+    return rt
+
+
+@mcp.tool()
 async def add_relationship_type(
     workspace_id: str,
     ontology_id: str,
@@ -607,8 +789,15 @@ async def add_relationship_type(
         source_entity_type_id: The source entity type ID.
         target_entity_type_id: The target entity type ID.
     """
+    _validate_name(name, "relationship name")
     client = _client(ctx)
     decoded = await _get_decoded_definition(client, workspace_id, ontology_id)
+
+    # Validate entity types exist
+    if source_entity_type_id not in decoded.get("entityTypes", {}):
+        raise ValueError(f"Source entity type {source_entity_type_id} not found.")
+    if target_entity_type_id not in decoded.get("entityTypes", {}):
+        raise ValueError(f"Target entity type {target_entity_type_id} not found.")
 
     rt_id = _generate_id()
     rel_def = {
@@ -652,6 +841,36 @@ async def remove_relationship_type(
     del decoded["relationshipTypes"][relationship_type_id]
     await _push_definition(client, workspace_id, ontology_id, decoded)
     return f"Relationship type {relationship_type_id} removed successfully."
+
+
+@mcp.tool()
+async def update_relationship_type(
+    workspace_id: str,
+    ontology_id: str,
+    relationship_type_id: str,
+    name: str,
+    ctx: Context,
+) -> dict:
+    """Rename a relationship type.
+
+    Args:
+        workspace_id: The workspace UUID.
+        ontology_id: The ontology UUID.
+        relationship_type_id: The relationship type ID.
+        name: New name for the relationship type.
+    """
+    _validate_name(name, "relationship name")
+    client = _client(ctx)
+    decoded = await _get_decoded_definition(client, workspace_id, ontology_id)
+
+    rt = decoded.get("relationshipTypes", {}).get(relationship_type_id)
+    if not rt:
+        raise ValueError(f"Relationship type {relationship_type_id} not found.")
+
+    rt["definition"]["name"] = name
+    await _push_definition(client, workspace_id, ontology_id, decoded)
+    logger.info("Updated relationship type %s", relationship_type_id)
+    return rt["definition"]
 
 
 # ════════════════════════════════════════════════════════════════
@@ -709,8 +928,8 @@ async def add_data_binding(
     if not et:
         raise ValueError(f"Entity type {entity_type_id} not found.")
 
-    src_props = json.loads(source_table_properties) if isinstance(source_table_properties, str) else source_table_properties
-    bindings = json.loads(property_bindings) if isinstance(property_bindings, str) else property_bindings
+    src_props = _parse_json(source_table_properties, "source_table_properties")
+    bindings = _parse_json(property_bindings, "property_bindings")
 
     db_id = str(uuid.uuid4())
     data_binding = {
@@ -793,9 +1012,86 @@ async def add_document(
     return doc
 
 
+@mcp.tool()
+async def list_documents(
+    workspace_id: str,
+    ontology_id: str,
+    entity_type_id: str,
+    ctx: Context,
+) -> list[dict]:
+    """List all documents attached to an entity type.
+
+    Args:
+        workspace_id: The workspace UUID.
+        ontology_id: The ontology UUID.
+        entity_type_id: The entity type ID.
+    """
+    decoded = await _get_decoded_definition(_client(ctx), workspace_id, ontology_id)
+    et = decoded.get("entityTypes", {}).get(entity_type_id)
+    if not et:
+        raise ValueError(f"Entity type {entity_type_id} not found.")
+    return et.get("documents", [])
+
+
+@mcp.tool()
+async def remove_document(
+    workspace_id: str,
+    ontology_id: str,
+    entity_type_id: str,
+    document_url: str,
+    ctx: Context,
+) -> str:
+    """Remove a document from an entity type by its URL.
+
+    Args:
+        workspace_id: The workspace UUID.
+        ontology_id: The ontology UUID.
+        entity_type_id: The entity type ID.
+        document_url: The URL of the document to remove.
+    """
+    client = _client(ctx)
+    decoded = await _get_decoded_definition(client, workspace_id, ontology_id)
+
+    et = decoded.get("entityTypes", {}).get(entity_type_id)
+    if not et:
+        raise ValueError(f"Entity type {entity_type_id} not found.")
+
+    original_count = len(et.get("documents", []))
+    et["documents"] = [d for d in et.get("documents", []) if d.get("url") != document_url]
+
+    if len(et.get("documents", [])) == original_count:
+        raise ValueError(f"Document with URL '{document_url}' not found.")
+
+    await _push_definition(client, workspace_id, ontology_id, decoded)
+    return f"Document removed successfully."
+
+
 # ════════════════════════════════════════════════════════════════
 #  OVERVIEW TOOLS
 # ════════════════════════════════════════════════════════════════
+
+
+@mcp.tool()
+async def get_overview(
+    workspace_id: str,
+    ontology_id: str,
+    entity_type_id: str,
+    ctx: Context,
+) -> dict:
+    """Get the current overview configuration for an entity type.
+
+    Returns widgets and settings, or an empty dict if no overview is configured.
+
+    Args:
+        workspace_id: The workspace UUID.
+        ontology_id: The ontology UUID.
+        entity_type_id: The entity type ID.
+    """
+    decoded = await _get_decoded_definition(_client(ctx), workspace_id, ontology_id)
+    et = decoded.get("entityTypes", {}).get(entity_type_id)
+    if not et:
+        raise ValueError(f"Entity type {entity_type_id} not found.")
+    return et.get("overviews", {})
 
 
 @mcp.tool()
@@ -821,7 +1117,7 @@ async def set_overview(
     if not et:
         raise ValueError(f"Entity type {entity_type_id} not found.")
 
-    overview = json.loads(overview_json) if isinstance(overview_json, str) else overview_json
+    overview = _parse_json(overview_json, "overview_json")
     et["overviews"] = overview
     await _push_definition(client, workspace_id, ontology_id, decoded)
     return overview
@@ -830,6 +1126,27 @@ async def set_overview(
 # ════════════════════════════════════════════════════════════════
 #  RESOURCE LINK TOOLS
 # ════════════════════════════════════════════════════════════════
+
+
+@mcp.tool()
+async def get_resource_links(
+    workspace_id: str,
+    ontology_id: str,
+    entity_type_id: str,
+    ctx: Context,
+) -> dict:
+    """Get the current resource links for an entity type.
+
+    Args:
+        workspace_id: The workspace UUID.
+        ontology_id: The ontology UUID.
+        entity_type_id: The entity type ID.
+    """
+    decoded = await _get_decoded_definition(_client(ctx), workspace_id, ontology_id)
+    et = decoded.get("entityTypes", {}).get(entity_type_id)
+    if not et:
+        raise ValueError(f"Entity type {entity_type_id} not found.")
+    return et.get("resourceLinks", {})
 
 
 @mcp.tool()
@@ -855,7 +1172,7 @@ async def set_resource_links(
     if not et:
         raise ValueError(f"Entity type {entity_type_id} not found.")
 
-    links = json.loads(resource_links_json) if isinstance(resource_links_json, str) else resource_links_json
+    links = _parse_json(resource_links_json, "resource_links_json")
     et["resourceLinks"] = links
     await _push_definition(client, workspace_id, ontology_id, decoded)
     return links
@@ -864,6 +1181,27 @@ async def set_resource_links(
 # ════════════════════════════════════════════════════════════════
 #  CONTEXTUALIZATION TOOLS
 # ════════════════════════════════════════════════════════════════
+
+
+@mcp.tool()
+async def list_contextualizations(
+    workspace_id: str,
+    ontology_id: str,
+    relationship_type_id: str,
+    ctx: Context,
+) -> list[dict]:
+    """List all contextualizations for a relationship type.
+
+    Args:
+        workspace_id: The workspace UUID.
+        ontology_id: The ontology UUID.
+        relationship_type_id: The relationship type ID.
+    """
+    decoded = await _get_decoded_definition(_client(ctx), workspace_id, ontology_id)
+    rt = decoded.get("relationshipTypes", {}).get(relationship_type_id)
+    if not rt:
+        raise ValueError(f"Relationship type {relationship_type_id} not found.")
+    return rt.get("contextualizations", [])
 
 
 @mcp.tool()
@@ -895,9 +1233,9 @@ async def add_contextualization(
     if not rt:
         raise ValueError(f"Relationship type {relationship_type_id} not found.")
 
-    ctx_table = json.loads(data_binding_table) if isinstance(data_binding_table, str) else data_binding_table
-    src_bindings = json.loads(source_key_ref_bindings) if isinstance(source_key_ref_bindings, str) else source_key_ref_bindings
-    tgt_bindings = json.loads(target_key_ref_bindings) if isinstance(target_key_ref_bindings, str) else target_key_ref_bindings
+    ctx_table = _parse_json(data_binding_table, "data_binding_table")
+    src_bindings = _parse_json(source_key_ref_bindings, "source_key_ref_bindings")
+    tgt_bindings = _parse_json(target_key_ref_bindings, "target_key_ref_bindings")
 
     ctx_id = str(uuid.uuid4())
     contextualization = {

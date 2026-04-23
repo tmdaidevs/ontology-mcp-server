@@ -65,7 +65,9 @@ python -m src
 | Tool | Description |
 |------|-------------|
 | `list_entity_types` | List all entity types in an ontology |
+| `get_entity_type` | Get a single entity type with its bindings, documents, overviews, links |
 | `add_entity_type` | Create a new entity type with properties |
+| `update_entity_type` | Rename an entity type or change its display name property / ID parts |
 | `remove_entity_type` | Delete an entity type (and its relationships) |
 
 ### Properties
@@ -73,6 +75,7 @@ python -m src
 | Tool | Description |
 |------|-------------|
 | `add_property` | Add a property to an entity type |
+| `update_property` | Rename a property or change its value type |
 | `remove_property` | Remove a property from an entity type |
 
 ### Relationship Types
@@ -80,7 +83,9 @@ python -m src
 | Tool | Description |
 |------|-------------|
 | `list_relationship_types` | List relationships in an ontology |
-| `add_relationship_type` | Create a relationship between entity types |
+| `get_relationship_type` | Get a single relationship with its contextualizations |
+| `add_relationship_type` | Create a relationship between entity types (validates both exist) |
+| `update_relationship_type` | Rename a relationship type |
 | `remove_relationship_type` | Delete a relationship type |
 
 ### Data Bindings
@@ -96,13 +101,18 @@ python -m src
 | Tool | Description |
 |------|-------------|
 | `add_document` | Attach a document URL to an entity type |
+| `list_documents` | List all documents attached to an entity type |
+| `remove_document` | Remove a document by URL |
+| `get_overview` | Get the current overview configuration |
 | `set_overview` | Configure overview widgets for an entity type |
+| `get_resource_links` | Get the current resource links |
 | `set_resource_links` | Link Power BI reports to an entity type |
 
 ### Contextualizations
 
 | Tool | Description |
 |------|-------------|
+| `list_contextualizations` | List contextualizations for a relationship type |
 | `add_contextualization` | Define how a relationship is materialized from data |
 | `remove_contextualization` | Remove a contextualization |
 
@@ -126,6 +136,15 @@ src/
 ├── kusto_client.py      # Async Kusto REST query client
 └── server.py            # MCP server with all tools
 ```
+
+## Input Validation
+
+All tools validate inputs before calling the Fabric API:
+
+- **Names** must match `^[a-zA-Z][a-zA-Z0-9_-]{0,127}$` (entity types, properties, relationships)
+- **Value types** must be one of: `String`, `Boolean`, `DateTime`, `Object`, `BigInt`, `Double`
+- **JSON parameters** return clear error messages on parse failure
+- **Entity existence** is checked when creating relationships (both source and target must exist)
 
 ## Authentication
 
