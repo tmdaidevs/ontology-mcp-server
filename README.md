@@ -124,6 +124,16 @@ python -m src
 | `list_kql_tables` | List tables in a KQL database |
 | `get_kql_table_schema` | Get column names and types for a table |
 
+### Lakehouse & Workspace Data Discovery
+
+| Tool | Description |
+|------|-------------|
+| `discover_lakehouse_tables` | List all tables in a Lakehouse (via OneLake Table API) |
+| `get_lakehouse_table_schema` | Get columns with types and Ontology valueType mapping |
+| `discover_workspace_data` | **Full scan** — discover all Lakehouses + Eventhouses, all tables and schemas |
+
+> **Ontology planning workflow:** Call `discover_workspace_data` to scan a workspace, then use the returned schemas to design entity types, properties, relationships, and data bindings using the CRUD tools above.
+
 ## Project Structure
 
 ```

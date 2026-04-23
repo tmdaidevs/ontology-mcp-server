@@ -16,6 +16,7 @@ from mcp.server.fastmcp import Context, FastMCP
 from .definition_utils import decode_definition, encode_definition
 from .fabric_client import FabricClient
 from .kusto_client import KustoClient
+from .onelake_client import OneLakeClient, map_delta_type_to_ontology
 
 # ── Logging (MCP requires stderr) ──
 logging.basicConfig(
@@ -34,15 +35,18 @@ _NAME_PATTERN = re.compile(r"^[a-zA-Z][a-zA-Z0-9_-]{0,127}$")
 class AppContext:
     client: FabricClient
     kusto: KustoClient
+    onelake: OneLakeClient
 
 
 @asynccontextmanager
 async def lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
     client = FabricClient()
     kusto = KustoClient()
+    onelake = OneLakeClient()
     try:
-        yield AppContext(client=client, kusto=kusto)
+        yield AppContext(client=client, kusto=kusto, onelake=onelake)
     finally:
+        await onelake.close()
         await kusto.close()
         await client.close()
 
@@ -66,6 +70,10 @@ def _client(ctx: Context) -> FabricClient:
 
 def _kusto(ctx: Context) -> KustoClient:
     return ctx.request_context.lifespan_context.kusto
+
+
+def _onelake(ctx: Context) -> OneLakeClient:
+    return ctx.request_context.lifespan_context.onelake
 
 
 def _validate_kusto_host(uri: str) -> None:
@@ -1278,6 +1286,193 @@ async def remove_contextualization(
     ]
     await _push_definition(client, workspace_id, ontology_id, decoded)
     return f"Contextualization {contextualization_id} removed successfully."
+
+
+# ════════════════════════════════════════════════════════════════
+#  LAKEHOUSE DATA DISCOVERY TOOLS (OneLake Table API)
+# ════════════════════════════════════════════════════════════════
+
+
+@mcp.tool()
+async def discover_lakehouse_tables(
+    workspace_id: str,
+    lakehouse_id: str,
+    ctx: Context,
+) -> list[dict]:
+    """List all tables in a Lakehouse with their names and formats.
+
+    Uses the OneLake Delta Table API — no SQL endpoint needed.
+
+    Args:
+        workspace_id: The workspace UUID.
+        lakehouse_id: The Lakehouse item ID.
+    """
+    tables = await _onelake(ctx).list_tables(workspace_id, lakehouse_id)
+    return [
+        {
+            "name": t.get("name"),
+            "schema": t.get("schema_name", "dbo"),
+            "format": t.get("data_source_format"),
+        }
+        for t in tables
+    ]
+
+
+@mcp.tool()
+async def get_lakehouse_table_schema(
+    workspace_id: str,
+    lakehouse_id: str,
+    table_name: str,
+    ctx: Context,
+    schema_name: str = "dbo",
+) -> dict:
+    """Get the full column schema of a Lakehouse table.
+
+    Returns column names, types, nullability, and the mapped Ontology valueType
+    for each column — useful for planning entity types and data bindings.
+
+    Args:
+        workspace_id: The workspace UUID.
+        lakehouse_id: The Lakehouse item ID.
+        table_name: The table name.
+        schema_name: Schema name (default: "dbo").
+    """
+    table = await _onelake(ctx).get_table(
+        workspace_id, lakehouse_id, table_name, schema_name
+    )
+    columns = []
+    for col in table.get("columns", []):
+        type_name = col.get("type_name", "string")
+        columns.append({
+            "name": col.get("name"),
+            "type": type_name,
+            "ontologyValueType": map_delta_type_to_ontology(type_name),
+            "nullable": col.get("nullable", True),
+            "position": col.get("position"),
+        })
+    return {
+        "table": table_name,
+        "schema": schema_name,
+        "format": table.get("data_source_format"),
+        "columns": columns,
+    }
+
+
+@mcp.tool()
+async def discover_workspace_data(
+    workspace_id: str,
+    ctx: Context,
+) -> dict:
+    """Scan all Lakehouses and Eventhouses in a workspace and return their table schemas.
+
+    This is the starting point for planning an ontology — it discovers all available
+    data items and tables so you can design entity types, properties, and bindings.
+
+    For each Lakehouse: uses the OneLake Delta Table API to get table schemas.
+    For each Eventhouse/KQL Database: uses the Kusto REST API to get table schemas.
+
+    Args:
+        workspace_id: The workspace UUID.
+    """
+    fabric = _client(ctx)
+    onelake = _onelake(ctx)
+    kusto = _kusto(ctx)
+
+    items = await fabric.list_workspace_items(workspace_id)
+
+    result: dict[str, Any] = {
+        "workspace_id": workspace_id,
+        "lakehouses": [],
+        "eventhouses": [],
+    }
+
+    # Discover Lakehouse tables
+    lakehouses = [i for i in items if i.get("type") == "Lakehouse"]
+    for lh in lakehouses:
+        lh_id = lh["id"]
+        lh_name = lh.get("displayName", lh_id)
+        lh_entry: dict[str, Any] = {
+            "id": lh_id,
+            "name": lh_name,
+            "tables": [],
+        }
+        try:
+            tables = await onelake.list_tables(workspace_id, lh_id)
+            for t in tables:
+                t_name = t.get("name", "")
+                try:
+                    t_detail = await onelake.get_table(
+                        workspace_id, lh_id, t_name
+                    )
+                    columns = [
+                        {
+                            "name": c.get("name"),
+                            "type": c.get("type_name", "string"),
+                            "ontologyValueType": map_delta_type_to_ontology(
+                                c.get("type_name", "string")
+                            ),
+                        }
+                        for c in t_detail.get("columns", [])
+                    ]
+                    lh_entry["tables"].append({
+                        "name": t_name,
+                        "columns": columns,
+                    })
+                except Exception as e:
+                    logger.warning("Failed to get schema for %s.%s: %s", lh_name, t_name, e)
+                    lh_entry["tables"].append({"name": t_name, "error": str(e)})
+        except Exception as e:
+            logger.warning("Failed to list tables for lakehouse %s: %s", lh_name, e)
+            lh_entry["error"] = str(e)
+        result["lakehouses"].append(lh_entry)
+
+    # Discover Eventhouse/KQL Database tables
+    kql_dbs = [i for i in items if i.get("type") == "KQLDatabase"]
+    for db in kql_dbs:
+        db_id = db["id"]
+        db_name = db.get("displayName", db_id)
+        eh_entry: dict[str, Any] = {
+            "id": db_id,
+            "name": db_name,
+            "tables": [],
+        }
+        try:
+            db_info = await fabric.get_kql_database(workspace_id, db_id)
+            props = db_info.get("properties", {})
+            cluster_uri = props.get("queryServiceUri")
+            kql_db_name = props.get("databaseName")
+            parent_eh = props.get("parentEventhouseItemId")
+            eh_entry["clusterUri"] = cluster_uri
+            eh_entry["databaseName"] = kql_db_name
+            eh_entry["parentEventhouseId"] = parent_eh
+
+            if cluster_uri and kql_db_name:
+                _validate_kusto_host(cluster_uri)
+                table_names = await kusto.list_tables(cluster_uri, kql_db_name)
+                for t_name in table_names:
+                    try:
+                        cols = await kusto.get_table_schema(
+                            cluster_uri, kql_db_name, t_name
+                        )
+                        eh_entry["tables"].append({
+                            "name": t_name,
+                            "columns": cols,
+                        })
+                    except Exception as e:
+                        logger.warning("Failed to get schema for KQL %s.%s: %s", db_name, t_name, e)
+                        eh_entry["tables"].append({"name": t_name, "error": str(e)})
+        except Exception as e:
+            logger.warning("Failed to discover KQL database %s: %s", db_name, e)
+            eh_entry["error"] = str(e)
+        result["eventhouses"].append(eh_entry)
+
+    logger.info(
+        "Discovered %d lakehouses, %d KQL databases in workspace %s",
+        len(result["lakehouses"]),
+        len(result["eventhouses"]),
+        workspace_id,
+    )
+    return result
 
 
 # ════════════════════════════════════════════════════════════════
