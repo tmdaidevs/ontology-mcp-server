@@ -12,19 +12,25 @@ from mcp.server.fastmcp import Context, FastMCP
 
 from .definition_utils import decode_definition, encode_definition
 from .fabric_client import FabricClient
+from .kusto_client import KustoClient
+
+_VALID_KUSTO_HOSTS = (".kusto.fabric.microsoft.com", ".kusto.windows.net")
 
 
 @dataclass
 class AppContext:
     client: FabricClient
+    kusto: KustoClient
 
 
 @asynccontextmanager
 async def lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
     client = FabricClient()
+    kusto = KustoClient()
     try:
-        yield AppContext(client=client)
+        yield AppContext(client=client, kusto=kusto)
     finally:
+        await kusto.close()
         await client.close()
 
 
@@ -45,6 +51,20 @@ def _client(ctx: Context) -> FabricClient:
     return ctx.request_context.lifespan_context.client
 
 
+def _kusto(ctx: Context) -> KustoClient:
+    return ctx.request_context.lifespan_context.kusto
+
+
+def _validate_kusto_host(uri: str) -> None:
+    """Ensure cluster URI points to a legitimate Kusto/Fabric endpoint."""
+    from urllib.parse import urlparse
+    host = urlparse(uri).hostname or ""
+    if not any(host.endswith(suffix) for suffix in _VALID_KUSTO_HOSTS):
+        raise ValueError(
+            f"Invalid Kusto cluster URI. Host must end with one of: {', '.join(_VALID_KUSTO_HOSTS)}"
+        )
+
+
 def _generate_id() -> str:
     """Generate a positive 64-bit integer ID as string."""
     return str(random.randint(10**12, 2**53))
@@ -63,6 +83,104 @@ async def list_workspaces(ctx: Context) -> list[dict]:
     Use this to find the workspace_id needed for other operations.
     """
     return await _client(ctx).list_workspaces()
+
+
+@mcp.tool()
+async def list_workspace_items(
+    workspace_id: str,
+    ctx: Context,
+    item_type: Optional[str] = None,
+) -> list[dict]:
+    """List items in a Fabric workspace, optionally filtered by type.
+
+    Useful for discovering Eventhouses, KQL Databases, Lakehouses, etc.
+
+    Args:
+        workspace_id: The workspace UUID.
+        item_type: Optional type filter (e.g., Eventhouse, KQLDatabase, Lakehouse, Notebook, Pipeline, SemanticModel, Report).
+    """
+    return await _client(ctx).list_workspace_items(workspace_id, item_type)
+
+
+# ════════════════════════════════════════════════════════════════
+#  KQL DATABASE DISCOVERY TOOLS
+# ════════════════════════════════════════════════════════════════
+
+
+@mcp.tool()
+async def get_kql_database_details(
+    workspace_id: str,
+    kql_database_id: str,
+    ctx: Context,
+) -> dict:
+    """Get details of a KQL database including its query URI, database name, and parent Eventhouse.
+
+    Use this to obtain the cluster_uri and database_name needed for KQL queries.
+
+    Args:
+        workspace_id: The workspace UUID.
+        kql_database_id: The KQL database item ID.
+    """
+    result = await _client(ctx).get_kql_database(workspace_id, kql_database_id)
+    props = result.get("properties", {})
+    return {
+        "id": result.get("id"),
+        "displayName": result.get("displayName"),
+        "queryServiceUri": props.get("queryServiceUri"),
+        "databaseName": props.get("databaseName"),
+        "parentEventhouseItemId": props.get("parentEventhouseItemId"),
+    }
+
+
+@mcp.tool()
+async def list_kql_tables(
+    workspace_id: str,
+    kql_database_id: str,
+    ctx: Context,
+) -> list[str]:
+    """List all tables in a KQL database (Eventhouse).
+
+    Resolves the cluster URI from the KQL database metadata — no raw URIs needed.
+
+    Args:
+        workspace_id: The workspace UUID.
+        kql_database_id: The KQL database item ID.
+    """
+    db_info = await _client(ctx).get_kql_database(workspace_id, kql_database_id)
+    props = db_info.get("properties", {})
+    cluster_uri = props.get("queryServiceUri")
+    db_name = props.get("databaseName")
+    if not cluster_uri or not db_name:
+        raise ValueError("Could not resolve cluster URI or database name from KQL database metadata.")
+    _validate_kusto_host(cluster_uri)
+    return await _kusto(ctx).list_tables(cluster_uri, db_name)
+
+
+@mcp.tool()
+async def get_kql_table_schema(
+    workspace_id: str,
+    kql_database_id: str,
+    table_name: str,
+    ctx: Context,
+) -> list[dict]:
+    """Get the column schema of a table in a KQL database.
+
+    Returns each column's name and data type — useful for building data binding
+    property mappings.
+
+    Args:
+        workspace_id: The workspace UUID.
+        kql_database_id: The KQL database item ID.
+        table_name: The table to inspect.
+    """
+    db_info = await _client(ctx).get_kql_database(workspace_id, kql_database_id)
+    props = db_info.get("properties", {})
+    cluster_uri = props.get("queryServiceUri")
+    db_name = props.get("databaseName")
+    if not cluster_uri or not db_name:
+        raise ValueError("Could not resolve cluster URI or database name from KQL database metadata.")
+    _validate_kusto_host(cluster_uri)
+    return await _kusto(ctx).get_table_schema(cluster_uri, db_name, table_name)
 
 
 # ════════════════════════════════════════════════════════════════

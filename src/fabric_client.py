@@ -213,7 +213,7 @@ class FabricClient:
             params=params,
         )
 
-    # ── Workspace listing (convenience) ──
+    # ── Workspace listing ──
 
     async def list_workspaces(self) -> list[dict]:
         """List all workspaces accessible to the current user."""
@@ -221,6 +221,31 @@ class FabricClient:
         if isinstance(result, dict):
             return result.get("value", [])
         return result or []
+
+    async def list_workspace_items(
+        self, workspace_id: str, item_type: str | None = None
+    ) -> list[dict]:
+        """List items in a workspace, optionally filtered by type."""
+        params = {}
+        if item_type:
+            params["type"] = item_type
+        result = await self._request(
+            "GET", f"/workspaces/{workspace_id}/items", params=params or None
+        )
+        if isinstance(result, dict):
+            return result.get("value", [])
+        return result or []
+
+    # ── KQL Database details ──
+
+    async def get_kql_database(
+        self, workspace_id: str, kql_database_id: str
+    ) -> dict:
+        """Get KQL database details including queryServiceUri and databaseName."""
+        result = await self._request(
+            "GET", f"/workspaces/{workspace_id}/kqlDatabases/{kql_database_id}"
+        )
+        return result or {}
 
     async def close(self) -> None:
         if self._client and not self._client.is_closed:
