@@ -16,6 +16,7 @@ from mcp.server.fastmcp import Context, FastMCP
 from .definition_utils import decode_definition, encode_definition
 from .fabric_client import FabricClient
 from .kusto_client import KustoClient
+from .livy_client import LivyClient
 from .onelake_client import OneLakeClient, map_delta_type_to_ontology
 
 # ── Logging (MCP requires stderr) ──
@@ -36,6 +37,7 @@ class AppContext:
     client: FabricClient
     kusto: KustoClient
     onelake: OneLakeClient
+    livy: LivyClient
 
 
 @asynccontextmanager
@@ -43,9 +45,11 @@ async def lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
     client = FabricClient()
     kusto = KustoClient()
     onelake = OneLakeClient()
+    livy = LivyClient()
     try:
-        yield AppContext(client=client, kusto=kusto, onelake=onelake)
+        yield AppContext(client=client, kusto=kusto, onelake=onelake, livy=livy)
     finally:
+        await livy.close()
         await onelake.close()
         await kusto.close()
         await client.close()
@@ -74,6 +78,10 @@ def _kusto(ctx: Context) -> KustoClient:
 
 def _onelake(ctx: Context) -> OneLakeClient:
     return ctx.request_context.lifespan_context.onelake
+
+
+def _livy(ctx: Context) -> LivyClient:
+    return ctx.request_context.lifespan_context.livy
 
 
 def _validate_kusto_host(uri: str) -> None:
@@ -1473,6 +1481,298 @@ async def discover_workspace_data(
         workspace_id,
     )
     return result
+
+
+# ════════════════════════════════════════════════════════════════
+#  DATA PROFILING TOOLS — KQL (Eventhouse)
+# ════════════════════════════════════════════════════════════════
+
+
+@mcp.tool()
+async def preview_kql_table(
+    workspace_id: str,
+    kql_database_id: str,
+    table_name: str,
+    ctx: Context,
+    limit: int = 100,
+) -> dict:
+    """Preview rows from a KQL table in an Eventhouse.
+
+    Returns the first N rows to understand actual data values, patterns, and quality.
+
+    Args:
+        workspace_id: The workspace UUID.
+        kql_database_id: The KQL database item ID.
+        table_name: The table to preview.
+        limit: Number of rows to return (default 100, max 1000).
+    """
+    limit = min(limit, 1000)
+    db_info = await _client(ctx).get_kql_database(workspace_id, kql_database_id)
+    props = db_info.get("properties", {})
+    cluster_uri = props.get("queryServiceUri")
+    db_name = props.get("databaseName")
+    if not cluster_uri or not db_name:
+        raise ValueError("Could not resolve cluster URI or database name.")
+    _validate_kusto_host(cluster_uri)
+
+    kql = f"{table_name} | take {limit}"
+    frames = await _kusto(ctx).execute_query(cluster_uri, db_name, kql)
+
+    rows = []
+    columns = []
+    for frame in frames:
+        if frame.get("Columns"):
+            columns = [
+                {"name": c.get("ColumnName"), "type": c.get("DataType", c.get("ColumnType"))}
+                for c in frame["Columns"]
+            ]
+        rows.extend(frame.get("Rows", []))
+
+    return {"columns": columns, "rows": rows[:limit], "rowCount": len(rows)}
+
+
+@mcp.tool()
+async def profile_kql_table(
+    workspace_id: str,
+    kql_database_id: str,
+    table_name: str,
+    ctx: Context,
+) -> dict:
+    """Profile a KQL table — row count, distinct counts, null rates, sample values, and date ranges.
+
+    Helps identify entity keys, foreign keys, optional properties, and timeseries columns.
+
+    Args:
+        workspace_id: The workspace UUID.
+        kql_database_id: The KQL database item ID.
+        table_name: The table to profile.
+    """
+    db_info = await _client(ctx).get_kql_database(workspace_id, kql_database_id)
+    props = db_info.get("properties", {})
+    cluster_uri = props.get("queryServiceUri")
+    db_name = props.get("databaseName")
+    if not cluster_uri or not db_name:
+        raise ValueError("Could not resolve cluster URI or database name.")
+    _validate_kusto_host(cluster_uri)
+
+    kusto = _kusto(ctx)
+
+    # Get row count
+    count_frames = await kusto.execute_query(
+        cluster_uri, db_name, f"{table_name} | count"
+    )
+    row_count = 0
+    for f in count_frames:
+        for r in f.get("Rows", []):
+            if r:
+                row_count = r[0]
+
+    # Get schema
+    schema = await kusto.get_table_schema(cluster_uri, db_name, table_name)
+
+    # Profile each column
+    col_profiles = []
+    for col in schema:
+        col_name = col["name"]
+        col_type = col["type"]
+
+        profile: dict[str, Any] = {
+            "name": col_name,
+            "type": col_type,
+        }
+
+        # Distinct count + null count + sample values in one query
+        kql = (
+            f"{table_name} | summarize "
+            f"distinct_count=dcount({col_name}), "
+            f"null_count=countif(isnull({col_name})), "
+            f"total=count()"
+        )
+        try:
+            frames = await kusto.execute_query(cluster_uri, db_name, kql)
+            for f in frames:
+                for r in f.get("Rows", []):
+                    if len(r) >= 3:
+                        profile["distinctCount"] = r[0]
+                        profile["nullCount"] = r[1]
+                        profile["nullRate"] = round(r[1] / max(r[2], 1), 4)
+        except Exception:
+            pass
+
+        # Sample values (top 5 distinct)
+        try:
+            sample_kql = (
+                f"{table_name} | where isnotnull({col_name}) "
+                f"| summarize count() by {col_name} "
+                f"| top 5 by count_ desc | project {col_name}"
+            )
+            frames = await kusto.execute_query(cluster_uri, db_name, sample_kql)
+            samples = []
+            for f in frames:
+                for r in f.get("Rows", []):
+                    if r:
+                        samples.append(str(r[0]))
+            profile["sampleValues"] = samples
+        except Exception:
+            pass
+
+        # Min/max for date and numeric types
+        if col_type in ("datetime", "int", "long", "real", "decimal", "double"):
+            try:
+                mm_kql = (
+                    f"{table_name} | summarize "
+                    f"min_val=min({col_name}), max_val=max({col_name})"
+                )
+                frames = await kusto.execute_query(cluster_uri, db_name, mm_kql)
+                for f in frames:
+                    for r in f.get("Rows", []):
+                        if len(r) >= 2:
+                            profile["min"] = str(r[0])
+                            profile["max"] = str(r[1])
+            except Exception:
+                pass
+
+        col_profiles.append(profile)
+
+    return {
+        "table": table_name,
+        "rowCount": row_count,
+        "columns": col_profiles,
+    }
+
+
+# ════════════════════════════════════════════════════════════════
+#  DATA PROFILING TOOLS — Lakehouse (Spark SQL via Livy)
+# ════════════════════════════════════════════════════════════════
+
+
+@mcp.tool()
+async def preview_lakehouse_table(
+    workspace_id: str,
+    lakehouse_id: str,
+    table_name: str,
+    ctx: Context,
+    limit: int = 100,
+) -> dict:
+    """Preview rows from a Lakehouse table using Spark SQL.
+
+    First call may take 30-60 seconds for Spark session startup.
+    Subsequent calls reuse the session and are fast.
+
+    Args:
+        workspace_id: The workspace UUID.
+        lakehouse_id: The Lakehouse item ID.
+        table_name: The table to preview.
+        limit: Number of rows (default 100, max 1000).
+    """
+    limit = min(limit, 1000)
+    sql = f"SELECT * FROM {table_name} LIMIT {limit}"
+    result = await _livy(ctx).execute_sql_with_schema(
+        workspace_id, lakehouse_id, sql
+    )
+    return {
+        "columns": result.get("columns", []),
+        "rows": result.get("rows", []),
+        "rowCount": len(result.get("rows", [])),
+    }
+
+
+@mcp.tool()
+async def profile_lakehouse_table(
+    workspace_id: str,
+    lakehouse_id: str,
+    table_name: str,
+    ctx: Context,
+) -> dict:
+    """Profile a Lakehouse table — row count, distinct counts, null rates, sample values.
+
+    Runs Spark SQL to analyze data distributions. First call may take 30-60s for
+    session startup, then queries are fast.
+
+    Args:
+        workspace_id: The workspace UUID.
+        lakehouse_id: The Lakehouse item ID.
+        table_name: The table to profile.
+    """
+    livy = _livy(ctx)
+
+    # Get row count
+    count_result = await livy.execute_sql(
+        workspace_id, lakehouse_id,
+        f"SELECT COUNT(*) as cnt FROM {table_name}"
+    )
+    row_count = count_result[0][0] if count_result else 0
+
+    # Get column info
+    schema_result = await livy.execute_sql_with_schema(
+        workspace_id, lakehouse_id,
+        f"SELECT * FROM {table_name} LIMIT 1"
+    )
+    columns = schema_result.get("columns", [])
+
+    col_profiles = []
+    for col_info in columns:
+        col_name = col_info.get("name", "")
+        col_type = col_info.get("type", "string")
+
+        profile: dict[str, Any] = {
+            "name": col_name,
+            "type": col_type,
+            "ontologyValueType": map_delta_type_to_ontology(col_type),
+        }
+
+        # Distinct count + null count
+        try:
+            stats_result = await livy.execute_sql(
+                workspace_id, lakehouse_id,
+                f"SELECT COUNT(DISTINCT `{col_name}`) as dc, "
+                f"SUM(CASE WHEN `{col_name}` IS NULL THEN 1 ELSE 0 END) as nc, "
+                f"COUNT(*) as total "
+                f"FROM {table_name}"
+            )
+            if stats_result:
+                row = stats_result[0]
+                profile["distinctCount"] = row[0]
+                profile["nullCount"] = row[1]
+                profile["nullRate"] = round(row[1] / max(row[2], 1), 4)
+        except Exception:
+            pass
+
+        # Sample values (top 5)
+        try:
+            sample_result = await livy.execute_sql(
+                workspace_id, lakehouse_id,
+                f"SELECT CAST(`{col_name}` AS STRING) as val, COUNT(*) as cnt "
+                f"FROM {table_name} WHERE `{col_name}` IS NOT NULL "
+                f"GROUP BY `{col_name}` ORDER BY cnt DESC LIMIT 5"
+            )
+            profile["sampleValues"] = [str(r[0]) for r in sample_result if r]
+        except Exception:
+            pass
+
+        # Min/max for date/numeric types
+        if col_type in ("date", "timestamp", "timestamp_ntz", "datetime",
+                        "int", "integer", "long", "bigint", "short",
+                        "float", "double", "decimal"):
+            try:
+                mm_result = await livy.execute_sql(
+                    workspace_id, lakehouse_id,
+                    f"SELECT CAST(MIN(`{col_name}`) AS STRING), "
+                    f"CAST(MAX(`{col_name}`) AS STRING) FROM {table_name}"
+                )
+                if mm_result:
+                    profile["min"] = str(mm_result[0][0])
+                    profile["max"] = str(mm_result[0][1])
+            except Exception:
+                pass
+
+        col_profiles.append(profile)
+
+    return {
+        "table": table_name,
+        "rowCount": row_count,
+        "columns": col_profiles,
+    }
 
 
 # ════════════════════════════════════════════════════════════════

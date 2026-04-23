@@ -134,6 +134,17 @@ python -m src
 
 > **Ontology planning workflow:** Call `discover_workspace_data` to scan a workspace, then use the returned schemas to design entity types, properties, relationships, and data bindings using the CRUD tools above.
 
+### Data Profiling
+
+| Tool | Description |
+|------|-------------|
+| `preview_kql_table` | Preview first N rows from an Eventhouse table |
+| `profile_kql_table` | Row count, distinct counts, null rates, sample values, min/max per column |
+| `preview_lakehouse_table` | Preview first N rows from a Lakehouse table (Spark SQL via Livy) |
+| `profile_lakehouse_table` | Row count, distinct counts, null rates, sample values, min/max per column |
+
+> **Note:** First Lakehouse profiling call takes ~30-60s for Spark session startup. Subsequent queries reuse the session and are fast.
+
 ## Project Structure
 
 ```
